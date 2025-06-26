@@ -1,0 +1,29 @@
+version: '3.8'
+services:
+
+  model:
+    build:
+      context: ./model
+      dockerfile: Dockerfile
+    image: yourrepo/model:latest
+    # Run via `docker-compose run --rm model`
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+      - FEATURES_CSV_KEY=${FEATURES_CSV_KEY}
+      - S3_BUCKET=${S3_BUCKET}
+      - RESULTS_PREFIX=${RESULTS_PREFIX}
+      - SNS_TOPIC_ARN=${SNS_TOPIC_ARN}
+      - NUM_STOCKS=${NUM_STOCKS}
+      - TOP_N=${TOP_N}
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    image: yourrepo/api:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
