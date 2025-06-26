@@ -62,24 +62,23 @@ def main():
 
         chunks = []
         symbol_list = []
-        # First pass: read in chunks, clean & encode, gather symbols until limit
         for chunk in pd.read_csv(stream, parse_dates=['Date'], chunksize=200_000):
             # Drop unwanted columns
             drop_cols = ['Unnamed: 0','Unnamed: 0.1','CAPITALINE_CODE','CAPITALINE CODE']
             chunk.drop(columns=[c for c in drop_cols if c in chunk], inplace=True)
             chunk.replace([np.inf, -np.inf], np.nan, inplace=True)
             chunk.dropna(subset=['Return_5d'], inplace=True)
-            # one-hot encode Sector
+            # One-hot encode Sector
             chunk = pd.concat([chunk, pd.get_dummies(chunk['Sector'], prefix='Sector')],
                               axis=1).drop(columns=['Sector'])
-            # accumulate symbols
+            # Accumulate symbols
             if NUM_STOCKS:
                 new_syms = [s for s in chunk['Symbol'].unique() if s not in symbol_list]
                 symbol_list.extend(new_syms)
                 if len(symbol_list) >= NUM_STOCKS:
                     symbol_list = symbol_list[:NUM_STOCKS]
             chunks.append(chunk)
-            # continue reading full file even after symbol cap for filtering later
+            # continue reading all chunks even after symbol cap
             if NUM_STOCKS and len(symbol_list) >= NUM_STOCKS:
                 continue
 
@@ -96,9 +95,13 @@ def main():
         else:
             print(f"[{now}] 2) Processing ALL symbols ({df['Symbol'].nunique()} total)")
 
+        # sort & target
         df.sort_values(['Symbol','Date'], inplace=True)
         df.reset_index(drop=True, inplace=True)
         df['Target'] = (df['Return_5d'] > 0).astype(int)
+
+        # ── BUG FIX: compute week_start from data, not “today” ──
+        week_start = df['Date'].max()
 
         # 3) Train on full data
         now = datetime.now(timezone.utc)
@@ -110,34 +113,32 @@ def main():
         dall   = xgb.DMatrix(X_all, label=df['Target'], feature_names=feat_cols)
         bst    = xgb.train(MODEL_PARAMS, dall, num_boost_round=1000, verbose_eval=False)
 
-        # 3a) Save model JSON locally and upload
+        # 3a) Save model JSON locally and upload *into week_start folder*
         now = datetime.now(timezone.utc)
         print(f"[{now}] 3a) Saving and uploading model JSON")
         local_model = "xgb_model.json"
         bst.save_model(local_model)
-        run_prefix = f"{RESULTS_PREFIX}/{now.strftime('%Y-%m-%d')}"
+        run_prefix = f"{RESULTS_PREFIX}/{week_start.strftime('%Y-%m-%d')}"
         s3.upload_file(local_model, S3_BUCKET, f"{run_prefix}/{local_model}")
         os.remove(local_model)
         del X_all, dall
         gc.collect()
 
-        # 4) Next-week predictions
+        # 4) Next-week predictions (for week_start)
         now = datetime.now(timezone.utc)
-        print(f"[{now}] 4) Generating next-week predictions")
-        last_date   = df['Date'].max()
-        mask_last   = df['Date'] == last_date
+        print(f"[{now}] 4) Generating next-week predictions for week starting {week_start.date()}")
+        mask_last   = df['Date'] == week_start
         X_live      = scaler.transform(df.loc[mask_last, feat_cols])
         syms_live   = df.loc[mask_last, 'Symbol'].values
         scores_live = bst.predict(xgb.DMatrix(X_live, feature_names=feat_cols))
-        next_week   = last_date + timedelta(days=1)
 
         out = pd.DataFrame({
             'Symbol':     syms_live,
             'Score':      scores_live,
-            'Week_Start': next_week
+            'Week_Start': week_start
         }).sort_values('Score', ascending=False)
 
-        # 5) Write & upload predictions CSV
+        # 5) Write & upload predictions CSV into same folder
         now = datetime.now(timezone.utc)
         print(f"[{now}] 5) Writing and uploading next_week_predictions.csv")
         local_out = "next_week_predictions.csv"
@@ -151,8 +152,8 @@ def main():
             now = datetime.now(timezone.utc)
             print(f"[{now}] 6) Publishing top {TOP_N} via SNS (run time: {elapsed:.1f}s)")
             topn = out.head(TOP_N)
-            msg   = f"Top {TOP_N} picks for week starting {next_week.date()} (run time: {elapsed:.1f}s):\n"
-            msg  += "\n".join(
+            msg  = f"Top {TOP_N} picks for week starting {week_start.date()} (run time: {elapsed:.1f}s):\n"
+            msg += "\n".join(
                 f"{i+1}. {sym} (score={score:.4f})"
                 for i,(sym,score) in enumerate(zip(topn['Symbol'], topn['Score']))
             )
