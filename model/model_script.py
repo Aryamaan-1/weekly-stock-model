@@ -41,17 +41,20 @@ s3  = boto3.client('s3',   region_name=AWS_REGION)
 sns = boto3.client('sns',  region_name=AWS_REGION) if SNS_TOPIC_ARN else None
 
 def notify_error(subject, message):
-    print(f"[{datetime.now(datetime.timezone.utc)}] ERROR: {subject}\n{message}")
+    now = datetime.now(timezone.utc)
+    print(f"[{now}] ERROR: {subject}\n{message}")
     if sns:
         sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=message)
 
 def main():
     start_time = time.time()
     try:
-        print(f"[{datetime.now(datetime.timezone.utc)}] === STARTING MODEL RUN ===")
+        now = datetime.now(timezone.utc)
+        print(f"[{now}] === STARTING MODEL RUN ===")
 
         # 1) Stream features CSV from S3 in chunks
-        print(f"[{datetime.now(datetime.timezone.utc)}] 1) Streaming feature CSV in chunks from s3://{S3_BUCKET}/{FEATURES_CSV_KEY}")
+        now = datetime.now(timezone.utc)
+        print(f"[{now}] 1) Streaming feature CSV in chunks from s3://{S3_BUCKET}/{FEATURES_CSV_KEY}")
         obj = s3.get_object(Bucket=S3_BUCKET, Key=FEATURES_CSV_KEY)
         stream = BytesIO(obj['Body'].read())
         del obj
@@ -76,9 +79,8 @@ def main():
                 if len(symbol_list) >= NUM_STOCKS:
                     symbol_list = symbol_list[:NUM_STOCKS]
             chunks.append(chunk)
-            # if symbol cap reached, we can stop adding more symbols
+            # continue reading full file even after symbol cap for filtering later
             if NUM_STOCKS and len(symbol_list) >= NUM_STOCKS:
-                # but still want all data for those symbols, so continue reading full file
                 continue
 
         # concatenate all cleaned chunks
@@ -87,18 +89,20 @@ def main():
         gc.collect()
 
         # 2) Filter symbols if requested
+        now = datetime.now(timezone.utc)
         if NUM_STOCKS:
-            print(f"[{datetime.now(datetime.timezone.utc)}] 2) Filtering to top {NUM_STOCKS} symbols")
+            print(f"[{now}] 2) Filtering to top {NUM_STOCKS} symbols")
             df = df[df['Symbol'].isin(symbol_list)].copy()
         else:
-            print(f"[{datetime.now(datetime.timezone.utc)}] 2) Processing ALL symbols ({df['Symbol'].nunique()} total)")
+            print(f"[{now}] 2) Processing ALL symbols ({df['Symbol'].nunique()} total)")
 
         df.sort_values(['Symbol','Date'], inplace=True)
         df.reset_index(drop=True, inplace=True)
         df['Target'] = (df['Return_5d'] > 0).astype(int)
 
         # 3) Train on full data
-        print(f"[{datetime.now(datetime.timezone.utc)}] 3) Training XGBoost on full dataset")
+        now = datetime.now(timezone.utc)
+        print(f"[{now}] 3) Training XGBoost on full dataset")
         feat_cols = [c for c in df.select_dtypes(include=[np.number]).columns
                      if c not in ['Return_1d','Return_5d','Return_10d','Target']]
         scaler = StandardScaler().fit(df[feat_cols])
@@ -107,17 +111,19 @@ def main():
         bst    = xgb.train(MODEL_PARAMS, dall, num_boost_round=1000, verbose_eval=False)
 
         # 3a) Save model JSON locally and upload
-        print(f"[{datetime.now(datetime.timezone.utc)}] 3a) Saving and uploading model JSON")
+        now = datetime.now(timezone.utc)
+        print(f"[{now}] 3a) Saving and uploading model JSON")
         local_model = "xgb_model.json"
         bst.save_model(local_model)
-        run_prefix = f"{RESULTS_PREFIX}/{datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d')}"
+        run_prefix = f"{RESULTS_PREFIX}/{now.strftime('%Y-%m-%d')}"
         s3.upload_file(local_model, S3_BUCKET, f"{run_prefix}/{local_model}")
         os.remove(local_model)
         del X_all, dall
         gc.collect()
 
         # 4) Next-week predictions
-        print(f"[{datetime.now(datetime.timezone.utc)}] 4) Generating next-week predictions")
+        now = datetime.now(timezone.utc)
+        print(f"[{now}] 4) Generating next-week predictions")
         last_date   = df['Date'].max()
         mask_last   = df['Date'] == last_date
         X_live      = scaler.transform(df.loc[mask_last, feat_cols])
@@ -132,7 +138,8 @@ def main():
         }).sort_values('Score', ascending=False)
 
         # 5) Write & upload predictions CSV
-        print(f"[{datetime.now(datetime.timezone.utc)}] 5) Writing and uploading next_week_predictions.csv")
+        now = datetime.now(timezone.utc)
+        print(f"[{now}] 5) Writing and uploading next_week_predictions.csv")
         local_out = "next_week_predictions.csv"
         out.to_csv(local_out, index=False)
         s3.upload_file(local_out, S3_BUCKET, f"{run_prefix}/{local_out}")
@@ -141,7 +148,8 @@ def main():
         # 6) Publish top-N via SNS, including run time
         if sns:
             elapsed = time.time() - start_time
-            print(f"[{datetime.now(datetime.timezone.utc)}] 6) Publishing top {TOP_N} via SNS (run time: {elapsed:.1f}s)")
+            now = datetime.now(timezone.utc)
+            print(f"[{now}] 6) Publishing top {TOP_N} via SNS (run time: {elapsed:.1f}s)")
             topn = out.head(TOP_N)
             msg   = f"Top {TOP_N} picks for week starting {next_week.date()} (run time: {elapsed:.1f}s):\n"
             msg  += "\n".join(
@@ -152,7 +160,8 @@ def main():
                         Subject="Weekly Model Picks", Message=msg)
 
         total_time = time.time() - start_time
-        print(f"[{datetime.now(datetime.timezone.utc)}] === MODEL RUN COMPLETE in {total_time:.1f}s ===")
+        now = datetime.now(timezone.utc)
+        print(f"[{now}] === MODEL RUN COMPLETE in {total_time:.1f}s ===")
 
     except Exception:
         tb = traceback.format_exc()
