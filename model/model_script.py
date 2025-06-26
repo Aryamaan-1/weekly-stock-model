@@ -1,8 +1,9 @@
 import os
 import gc
+import time
 import traceback
 from io import BytesIO
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, timezone
 
 import boto3
 import pandas as pd
@@ -11,12 +12,16 @@ import xgboost as xgb
 from sklearn.preprocessing import StandardScaler
 
 # === ENVIRONMENT VARIABLES ===
-AWS_REGION       = os.environ.get('AWS_REGION',     'us-east-1')
+AWS_REGION       = os.environ.get('AWS_REGION','ap-south-1')
 FEATURES_CSV_KEY = os.environ['FEATURES_CSV_KEY']
 S3_BUCKET        = os.environ['S3_BUCKET']
 RESULTS_PREFIX   = os.environ.get('RESULTS_PREFIX','results')
 SNS_TOPIC_ARN    = os.environ.get('SNS_TOPIC_ARN')   # unset to disable SNS
-NUM_STOCKS       = int(os.environ.get('NUM_STOCKS',500))
+
+# If NUM_STOCKS is not provided, process all symbols
+num_stocks_env = os.environ.get('NUM_STOCKS')
+NUM_STOCKS     = int(num_stocks_env) if num_stocks_env is not None else None
+
 TOP_N            = int(os.environ.get('TOP_N',10))
 MODEL_PARAMS     = {
     'objective':'binary:logistic',
@@ -35,47 +40,65 @@ MODEL_PARAMS     = {
 s3  = boto3.client('s3',   region_name=AWS_REGION)
 sns = boto3.client('sns',  region_name=AWS_REGION) if SNS_TOPIC_ARN else None
 
-# Date‑stamped S3 prefix
-today      = datetime.utcnow().strftime("%Y-%m-%d")
-run_prefix = f"{RESULTS_PREFIX}/{today}"
-
 def notify_error(subject, message):
-    print(f"[{datetime.utcnow()}] ERROR: {subject}\n{message}")
+    print(f"[{datetime.now(datetime.timezone.utc)}] ERROR: {subject}\n{message}")
     if sns:
         sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=message)
 
 def main():
+    start_time = time.time()
     try:
-        print(f"[{datetime.utcnow()}] === STARTING MODEL RUN ===")
+        print(f"[{datetime.now(datetime.timezone.utc)}] === STARTING MODEL RUN ===")
 
-        # 1) Stream features CSV from S3
-        print(f"[{datetime.utcnow()}] 1) Streaming feature CSV from s3://{S3_BUCKET}/{FEATURES_CSV_KEY}")
+        # 1) Stream features CSV from S3 in chunks
+        print(f"[{datetime.now(datetime.timezone.utc)}] 1) Streaming feature CSV in chunks from s3://{S3_BUCKET}/{FEATURES_CSV_KEY}")
         obj = s3.get_object(Bucket=S3_BUCKET, Key=FEATURES_CSV_KEY)
-        df = pd.read_csv(BytesIO(obj['Body'].read()), parse_dates=['Date'])
+        stream = BytesIO(obj['Body'].read())
         del obj
         gc.collect()
 
-        # 2) Clean & encode
-        print(f"[{datetime.utcnow()}] 2) Cleaning data")
-        drop_cols = ['Unnamed: 0','Unnamed: 0.1','CAPITALINE_CODE','CAPITALINE CODE']
-        df.drop(columns=[c for c in drop_cols if c in df], inplace=True)
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df.dropna(subset=['Return_5d'], inplace=True)
+        chunks = []
+        symbol_list = []
+        # First pass: read in chunks, clean & encode, gather symbols until limit
+        for chunk in pd.read_csv(stream, parse_dates=['Date'], chunksize=200_000):
+            # Drop unwanted columns
+            drop_cols = ['Unnamed: 0','Unnamed: 0.1','CAPITALINE_CODE','CAPITALINE CODE']
+            chunk.drop(columns=[c for c in drop_cols if c in chunk], inplace=True)
+            chunk.replace([np.inf, -np.inf], np.nan, inplace=True)
+            chunk.dropna(subset=['Return_5d'], inplace=True)
+            # one-hot encode Sector
+            chunk = pd.concat([chunk, pd.get_dummies(chunk['Sector'], prefix='Sector')],
+                              axis=1).drop(columns=['Sector'])
+            # accumulate symbols
+            if NUM_STOCKS:
+                new_syms = [s for s in chunk['Symbol'].unique() if s not in symbol_list]
+                symbol_list.extend(new_syms)
+                if len(symbol_list) >= NUM_STOCKS:
+                    symbol_list = symbol_list[:NUM_STOCKS]
+            chunks.append(chunk)
+            # if symbol cap reached, we can stop adding more symbols
+            if NUM_STOCKS and len(symbol_list) >= NUM_STOCKS:
+                # but still want all data for those symbols, so continue reading full file
+                continue
+
+        # concatenate all cleaned chunks
+        df = pd.concat(chunks, axis=0)
+        del chunks
+        gc.collect()
+
+        # 2) Filter symbols if requested
+        if NUM_STOCKS:
+            print(f"[{datetime.now(datetime.timezone.utc)}] 2) Filtering to top {NUM_STOCKS} symbols")
+            df = df[df['Symbol'].isin(symbol_list)].copy()
+        else:
+            print(f"[{datetime.now(datetime.timezone.utc)}] 2) Processing ALL symbols ({df['Symbol'].nunique()} total)")
+
         df.sort_values(['Symbol','Date'], inplace=True)
         df.reset_index(drop=True, inplace=True)
-
-        print(f"[{datetime.utcnow()}] 2a) One‑hot encoding Sector")
-        df = pd.concat([df, pd.get_dummies(df['Sector'], prefix='Sector')],
-                       axis=1).drop(columns=['Sector'])
-
-        # 3) Filter & target
-        print(f"[{datetime.utcnow()}] 3) Filtering top {NUM_STOCKS} symbols")
-        symbols = df['Symbol'].unique()[:NUM_STOCKS]
-        df      = df[df['Symbol'].isin(symbols)].copy()
         df['Target'] = (df['Return_5d'] > 0).astype(int)
 
-        # 4) Train on full data
-        print(f"[{datetime.utcnow()}] 4) Training XGBoost on full dataset")
+        # 3) Train on full data
+        print(f"[{datetime.now(datetime.timezone.utc)}] 3) Training XGBoost on full dataset")
         feat_cols = [c for c in df.select_dtypes(include=[np.number]).columns
                      if c not in ['Return_1d','Return_5d','Return_10d','Target']]
         scaler = StandardScaler().fit(df[feat_cols])
@@ -83,18 +106,18 @@ def main():
         dall   = xgb.DMatrix(X_all, label=df['Target'], feature_names=feat_cols)
         bst    = xgb.train(MODEL_PARAMS, dall, num_boost_round=1000, verbose_eval=False)
 
-        # 4a) Save model JSON locally and upload
-        print(f"[{datetime.utcnow()}] 4a) Saving and uploading model JSON")
+        # 3a) Save model JSON locally and upload
+        print(f"[{datetime.now(datetime.timezone.utc)}] 3a) Saving and uploading model JSON")
         local_model = "xgb_model.json"
         bst.save_model(local_model)
+        run_prefix = f"{RESULTS_PREFIX}/{datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d')}"
         s3.upload_file(local_model, S3_BUCKET, f"{run_prefix}/{local_model}")
         os.remove(local_model)
-
         del X_all, dall
         gc.collect()
 
-        # 5) Next‑week predictions
-        print(f"[{datetime.utcnow()}] 5) Generating next‑week predictions")
+        # 4) Next-week predictions
+        print(f"[{datetime.now(datetime.timezone.utc)}] 4) Generating next-week predictions")
         last_date   = df['Date'].max()
         mask_last   = df['Date'] == last_date
         X_live      = scaler.transform(df.loc[mask_last, feat_cols])
@@ -108,26 +131,28 @@ def main():
             'Week_Start': next_week
         }).sort_values('Score', ascending=False)
 
-        # 6) Write & upload predictions CSV
-        print(f"[{datetime.utcnow()}] 6) Writing and uploading next_week_predictions.csv")
+        # 5) Write & upload predictions CSV
+        print(f"[{datetime.now(datetime.timezone.utc)}] 5) Writing and uploading next_week_predictions.csv")
         local_out = "next_week_predictions.csv"
         out.to_csv(local_out, index=False)
         s3.upload_file(local_out, S3_BUCKET, f"{run_prefix}/{local_out}")
         os.remove(local_out)
 
-        # 7) Publish top‑N via SNS
+        # 6) Publish top-N via SNS, including run time
         if sns:
-            print(f"[{datetime.utcnow()}] 7) Publishing top {TOP_N} via SNS")
-            top10 = out.head(TOP_N)
-            msg   = f"Top {TOP_N} picks for week starting {next_week.date()}:\n"
+            elapsed = time.time() - start_time
+            print(f"[{datetime.now(datetime.timezone.utc)}] 6) Publishing top {TOP_N} via SNS (run time: {elapsed:.1f}s)")
+            topn = out.head(TOP_N)
+            msg   = f"Top {TOP_N} picks for week starting {next_week.date()} (run time: {elapsed:.1f}s):\n"
             msg  += "\n".join(
                 f"{i+1}. {sym} (score={score:.4f})"
-                for i,(sym,score) in enumerate(zip(top10['Symbol'], top10['Score']))
+                for i,(sym,score) in enumerate(zip(topn['Symbol'], topn['Score']))
             )
             sns.publish(TopicArn=SNS_TOPIC_ARN,
                         Subject="Weekly Model Picks", Message=msg)
 
-        print(f"[{datetime.utcnow()}] === MODEL RUN COMPLETE ===")
+        total_time = time.time() - start_time
+        print(f"[{datetime.now(datetime.timezone.utc)}] === MODEL RUN COMPLETE in {total_time:.1f}s ===")
 
     except Exception:
         tb = traceback.format_exc()
