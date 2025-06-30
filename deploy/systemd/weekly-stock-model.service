@@ -8,14 +8,7 @@ Type=oneshot
 User=ec2-user
 WorkingDirectory=/home/ec2-user/weekly-stock-model
 
-Environment="FEATURES_CSV_KEY=processed/features.csv"
-Environment="AWS_DEFAULT_REGION=ap-south-1"
-Environment="AWS_REGION=ap-south-1"
-Environment="S3_BUCKET=hdfc-intern-stock-data"
-Environment="RESULTS_PREFIX=results"
-Environment="SNS_TOPIC_ARN=arn:aws:sns:ap-south-1:684711271899:StockUpdaterAlerts"
-Environment="NUM_STOCKS=500"
-Environment="TOP_N=10"
+# Environment Variables go here
 
 ExecStart=/home/ec2-user/weekly-stock-model/run-on-boot.sh
 TimeoutStartSec=1200
